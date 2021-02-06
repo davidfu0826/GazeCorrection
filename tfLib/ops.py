@@ -2,9 +2,8 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import tensorflow as tf
-from tensorflow.contrib.layers.python.layers import batch_norm
-from tensorflow.contrib.layers.python.layers import l2_regularizer
+import tensorflow.compat.v1 as tf
+tf.disable_v2_behavior()
 
 def log_sum_exp(x, axis=1):
     m = tf.reduce_max(x, keep_dims=True)
@@ -17,7 +16,8 @@ def lrelu(x, alpha=0.2, name="LeakyReLU"):
 def conv2d(input_, output_dim, kernel=4, stride=2, use_sp=False, padding='SAME', scope="conv2d", use_bias=True):
     with tf.variable_scope(scope):
         w = tf.get_variable('w', [kernel, kernel, input_.get_shape()[-1], output_dim],
-                            initializer=tf.contrib.layers.variance_scaling_initializer(), regularizer=l2_regularizer(scale=0.0001))
+                            initializer=tf.keras.initializers.VarianceScaling(), regularizer=tf.keras.regularizers.L2(l2=0.0001))
+
         if use_sp != True:
             conv = tf.nn.conv2d(input_, w, strides=[1, stride, stride, 1], padding=padding)
         else:
@@ -156,7 +156,7 @@ def de_conv(input_, output_shape,
     with tf.variable_scope(scope):
 
         w = tf.get_variable('w', [k_h, k_w, output_shape[-1], input_.get_shape()[-1]], dtype=tf.float32,
-                            initializer=tf.contrib.layers.variance_scaling_initializer())
+                            initializer=tf.keras.initializers.VarianceScaling())
         if use_sp:
             deconv = tf.nn.conv2d_transpose(input_, w, output_shape=output_shape,
                                             strides=[1, d_h, d_w, 1])
@@ -203,7 +203,7 @@ def fully_connect(input_, output_size, scope=None, use_sp=False,
   shape = input_.get_shape().as_list()
   with tf.variable_scope(scope or "Linear"):
     matrix = tf.get_variable("Matrix", [shape[1], output_size], tf.float32,
-                 initializer=tf.contrib.layers.variance_scaling_initializer(), regularizer=l2_regularizer(0.0001))
+                 initializer=tf.keras.initializers.VarianceScaling(), regularizer=tf.keras.regularizers.L2(l2=0.0001))
     bias = tf.get_variable("bias", [output_size], tf.float32,
       initializer=tf.constant_initializer(bias_start))
 
@@ -224,7 +224,8 @@ def conv_cond_concat(x, y):
     return tf.concat([x , y_reshaped*tf.ones([x_shapes[0], x_shapes[1], x_shapes[2] , y_shapes[-1]])], 3)
 
 def batch_normal(input, scope="scope", reuse=False):
-    return batch_norm(input, epsilon=1e-5, decay=0.9, scale=True, scope=scope, reuse=reuse, fused=True, updates_collections=None)
+    return tf.keras.layers.BatchNormalization(momentum=0.99, scale=True, center=True)(input)
+    #return batch_norm(input, epsilon=1e-5, decay=0.9, scale=True, scope=scope, reuse=reuse, fused=True, updates_collections=None)
 
 def _l2normalize(v, eps=1e-12):
   return v / (tf.reduce_sum(v ** 2) ** 0.5 + eps)
