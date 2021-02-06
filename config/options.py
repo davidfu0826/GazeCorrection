@@ -10,7 +10,7 @@ class BaseOptions():
     def initialize(self, parser):
 
         parser.add_argument('--data_dir', type=str,
-                            default='../dataset/NewGazeData', help='path to images')
+                            default='G:/Dataset/NewGazeData', help='path to images')
         parser.add_argument('--pretrain_path', type=str,
                             default='./sg_pre_model_g/', help='pretrained model path')
         parser.add_argument('--inception_path', type=str, default='../pretrained/')
