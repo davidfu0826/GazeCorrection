@@ -2,14 +2,15 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import tensorflow.compat.v1 as tf
-tf.disable_v2_behavior()
+import tensorflow as tf
+#import tensorflow.compat.v1 as tf
+#tf.disable_v2_behavior()
 
 def getfeature_matching_loss(feature1, feature2):
     return tf.reduce_mean(tf.abs(
         tf.reduce_mean(feature1, axis=[1, 2]) - tf.reduce_mean(feature2, axis=[1, 2])))
 
-def SSCE(logits, labels) :
+def SSCE(logits, labels) : # SSCE Sparse Softmax Cross Entropy
     loss = tf.reduce_mean(tf.nn.sparse_softmax_cross_entropy_with_logits(labels=labels, logits=logits))
     return loss
 

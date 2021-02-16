@@ -1,0 +1,7 @@
+__pycache__
+*_checkpoints/
+eye_encoder/
+NO_SPECTRAL/
+logs/
+log3_25_1/
+test123/

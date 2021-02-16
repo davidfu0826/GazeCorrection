@@ -15,96 +15,46 @@ import os
 #tf.disable_v2_behavior()
 import tensorflow as tf
 
-from tensorflow.keras.layers import LeakyReLU, ReLU, Dense, Conv2d, Conv2dTransposed
+from tensorflow.keras import Model
+from tensorflow.keras.layers import LeakyReLU, ReLU, Dense, Conv2D, Conv2DTranspose, Flatten, Reshape, Input
 from tensorflow_addons.layers import InstanceNormalization, SpectralNormalization
 
 class Gaze_GAN2(object):
 
     # build model
-    def __init__(self, dataset, opt):
+    def __init__(self, opt):
 
-        self.dataset = dataset
         self.opt = opt
-        # placeholder
-        self.x_left_p = tf.placeholder(tf.float32, [self.opt.batch_size, self.opt.pos_number])  # Left eye
-        self.x_right_p = tf.placeholder(tf.float32, [self.opt.batch_size, self.opt.pos_number]) # Right eye
-        self.x = tf.placeholder(tf.float32, [self.opt.batch_size, self.opt.img_size, self.opt.img_size, self.opt.input_nc])   # Input images (Whole face)
-        self.xm = tf.placeholder(tf.float32, [self.opt.batch_size, self.opt.img_size, self.opt.img_size, self.opt.output_nc]) # Final images (Whole face)
-        self.lr_decay = tf.placeholder(tf.float32, None, name='lr_decay')
 
-    def build_model(self):
-        """Construct training pipeline from x -> y
-        """
-        self.xc = self.x * (1 - self.xm)  #corrputed images
-        self.xl_left, self.xl_right = self.crop_resize(self.x, self.x_left_p, self.x_right_p)
+    def build_train_model(self):
+        inputs = Input((128, 128, 3))
+        outputs = self.encode(inputs) #encode(self, x): Encodes 2D image of eye region [B,H,W,3]
+        eye_encoder = Model(inputs=inputs, outputs=outputs, name="Eye encoder")
 
-        # Extract eyes into features
-        self.xl_left_fp  = self.encode(self.xl_left)
-        self.xl_right_fp = self.encode(self.xl_right)
+        inputs0, inputs1, inputs2, inputs3 = Input((256, 256, 3)), Input((256, 256, 3)), Input((128,)), Input((128,))
+        outputs = self.G(inputs0, inputs1, inputs2, inputs3, use_sp=self.opt.use_sp) # G(self, input_x, img_mask, fp_left, fp_right, use_sp=False)
+        generator = Model(inputs=[inputs0, inputs1, inputs2, inputs3], outputs=outputs, name="generator") 
 
-        # Generate gaze-corrected image
-        self.yo = self.G(self.xc, self.xm, self.xl_left_fp, self.xl_right_fp, use_sp=False)
+        inputs0, inputs1, inputs2, inputs3, inputs4 = Input((256, 256, 3)), Input((128, 128, 3)), Input((128, 128, 3)), Input((128,)), Input((128,))
+        outputs = self.D(inputs0, inputs1, inputs2, inputs3, inputs4) # D(self, x, xl_left, xl_right, fp_left, fp_right)
+        discriminator = Model(inputs=[inputs0, inputs1, inputs2, inputs3, inputs4], outputs=outputs, name="discriminator") 
 
-        # Extract eyes of generated image?
-        self.yl_left, self.yl_right = self.crop_resize(self.yo, self.x_left_p, self.x_right_p)
+        inputs = Input((128,))
+        outputs = self.decode(inputs) #encode(self, x): Encodes 2D image of eye region [B,H,W,3]
+        eye_decoder = Model(inputs=inputs, outputs=outputs, name="Eye decoder")
 
-        # Extract eyes into features?
-        self.yl_left_fp = self.encode(self.yl_left)
-        self.yl_right_fp = self.encode(self.yl_right)
-
-
-        self.y = self.xc + self.yo * self.xm
-
-        if self.opt.is_ss:
-
-            self.d_logits, self.d_logits_left, self.d_logits_right \
-                = self.D(self.x, self.xl_left, self.xl_right, self.xl_left_fp, self.xl_right_fp)
-            self.g_logits, self.g_logits_left, self.g_logits_right \
-                = self.D(self.y, self.yl_left, self.yl_right, self.yl_left_fp, self.yl_right_fp)
-            self.r_cls_loss = SSCE(labels=tf.zeros(shape=[self.opt.batch_size], dtype=tf.int32), logits=self.d_logits_left) + \
-                        SSCE(labels=tf.ones(shape=[self.opt.batch_size], dtype=tf.int32), logits=self.d_logits_right)
-            self.f_cls_loss = SSCE(labels=tf.zeros(shape=[self.opt.batch_size], dtype=tf.int32), logits=self.g_logits_left) + \
-                                   SSCE(labels=tf.ones(shape=[self.opt.batch_size], dtype=tf.int32), logits=self.g_logits_right)
-
-        else:
-            self.d_logits = self.D(self.x, self.xl_left, self.xl_right,
-                                                        self.xl_left_fp, self.xl_right_fp)
-            self.g_logits = self.D(self.y, self.yl_left, self.yl_right,
-                                                        self.yl_left_fp, self.yl_right_fp)
-
-        d_loss_fun, g_loss_fun = get_adversarial_loss(self.opt.loss_type)
-        self.d_gan_loss = d_loss_fun(self.d_logits, self.g_logits)
-        self.g_gan_loss = g_loss_fun(self.g_logits)
-
-        self.percep_loss = L1(self.xl_left_fp, self.yl_left_fp) + L1(self.xl_right_fp, self.yl_right_fp)
-        self.recon_loss = tf.reduce_mean(tf.reduce_sum(tf.abs(self.y - self.x),
-                            axis=[1, 2, 3]) / (self.opt.crop_w * self.opt.crop_h * self.opt.output_nc))
-
-        if self.opt.is_ss:
-            self.D_loss = self.d_gan_loss + self.opt.lam_ss * self.r_cls_loss
-            self.G_loss = self.g_gan_loss + self.opt.lam_r * self.recon_loss \
-                          + self.opt.lam_p * self.percep_loss + self.opt.lam_ss * self.f_cls_loss
-        else:
-            self.D_loss = self.d_gan_loss
-            self.G_loss = self.g_gan_loss + self.opt.lam_r * self.recon_loss + self.opt.lam_p * self.percep_loss
+        return eye_encoder, eye_decoder, generator, discriminator
 
     def build_test_model(self):
-        self.xc = self.x * (1 - self.xm)
-        self.xl_left, self.xl_right = self.crop_resize(self.x, self.x_left_p, self.x_right_p)
-        self.xl_left_fp = self.encode(self.xl_left)
-        self.xl_right_fp = self.encode(self.xl_right)
-        self.yo = self.G(self.xc, self.xm, self.xl_left_fp, self.xl_right_fp, use_sp=False)
-        self.y = self.xc + self.yo * self.xm
+        inputs = Input((128, 128, 3))
+        outputs = self.encode(inputs) #encode(self, x): Encodes 2D image of eye region [B,H,W,3]
+        eye_encoder = Model(inputs=inputs, outputs=outputs, name="Eye encoder")
 
+        inputs0, inputs1, inputs2, inputs3 = Input((256, 256, 3)), Input((256, 256, 3)), Input((128,)), Input((128,))
+        outputs = self.G(inputs0, inputs1, inputs2, inputs3, use_sp=self.opt.use_sp) # G(self, input_x, img_mask, fp_left, fp_right, use_sp=False)
+        generator = Model(inputs=[inputs0, inputs1, inputs2, inputs3], outputs=outputs, name="generator") 
 
-    def crop_resize(self, input, boxes_left, boxes_right):
-
-        shape = [int(item) for item in input.shape.as_list()]
-        return tf.image.crop_and_resize(input, boxes=boxes_left, box_ind=list(range(0, shape[0])),
-                                        crop_size=[int(shape[-3] / 2), int(shape[-2] / 2)]), \
-                tf.image.crop_and_resize(input, boxes=boxes_right, box_ind=list(range(0, shape[0])),
-                                    crop_size=[int(shape[-3] / 2), int(shape[-2] / 2)])
-
+        return eye_encoder, generator
     def test(self):
 
         init = tf.global_variables_initializer()
@@ -272,45 +222,58 @@ class Gaze_GAN2(object):
         return refined_list
 
     def D(self, x, xl_left, xl_right, fp_left, fp_right):
+        """Discriminator for adversarial training of face image generation
+
+        Input:
+            x: Full real image
+            xl_left:
+            xl_right:
+            fp_left:
+            fp_right:
         """
-        Compute all discriminator??
-        """
-        fc = functools.partial(fully_connect, use_sp=self.opt.use_sp)
-        with tf.variable_scope("D", reuse=tf.AUTO_REUSE):
 
-            xg_fp = self.global_d(x)
-            if self.opt.is_ss:
-                x1_left_fp, cls_left = self.local_d(xl_left)
-                xl_right_fp, cls_right = self.local_d(xl_right)
-                xl_fp = tf.concat([x1_left_fp, xl_right_fp], axis=-1)
-            else:
-                xl_fp = self.local_d(tf.concat([xl_left, xl_right], axis=-1))
+        xg_fp = self.global_d(x)
+        if self.opt.is_ss:
+            x1_left_fp, cls_left = self.local_d(xl_left)
+            xl_right_fp, cls_right = self.local_d(xl_right)
+            xl_fp = tf.concat([x1_left_fp, xl_right_fp], axis=-1)
+        else:
+            xl_fp = self.local_d(tf.concat([xl_left, xl_right], axis=-1))
 
-            # Concatenation
-            ful = tf.concat([xg_fp, xl_fp, fp_left, fp_right], axis=1)
-            ful = tf.nn.relu(fc(ful, output_size=512, scope='fc1'))
-            logits = fc(ful, output_size=1, scope='fc2')
+        # Concatenation
+        x = tf.concat([xg_fp, xl_fp, fp_left, fp_right], axis=1)
+        if self.opt.use_sp:
+            x = SpectralNormalization(Dense(512))(x)
+        else:
+            x = Dense(512)(x)
+        x = ReLU()(x)
+        if self.opt.use_sp:
+            logits = SpectralNormalization(Dense(1))(x)
+        else:
+            logits = Dense(1)(x)
 
-            if self.opt.is_ss:
-                return logits, cls_left, cls_right
-            else:
-                return logits
+        if self.opt.is_ss:
+            return logits, cls_left, cls_right
+        else:
+            return logits
 
-    # Converted to Keras
     def local_d(self, x):
-        
+        """Discriminator for adversarial training of eye image generation
+        """
         for i in range(self.opt.n_layers_d):
             output_dim = np.minimum(self.opt.ndf * np.power(2, i + 1), 256)
             if self.opt.use_sp:
-                x = SpectralNormalization()(x)
-            x = Conv2d(filters=output_dim, kernel_size=4, strides=2)(x)
+                x = SpectralNormalization(Conv2D(filters=output_dim, kernel_size=4, strides=2))(x)
+            else:
+                x = Conv2D(filters=output_dim, kernel_size=4, strides=2)(x)
             x = LeakyReLU()(x)
 
         x = Flatten()(x)
         
         if self.opt.use_sp:
-            x = SpectralNormalization()(x)
-        logits = Dense(dim)(x)
+            logits = SpectralNormalization(Dense(2))(x)
+        else:
+            logits = Dense(2)(x)
         fp = Dense(output_dim)(x)
 
         if self.opt.is_ss:
@@ -318,174 +281,136 @@ class Gaze_GAN2(object):
         else:
             return logits
 
-    # Converted to Keras
     def global_d(self, x):
         # Global Discriminator Dg
         for i in range(self.opt.n_layers_d):
             dim = np.minimum(self.opt.ndf * np.power(2, i + 1), 256)
 
             if self.opt.use_sp:
-                x = SpectralNormalization()(x)
-            x = Conv2d(filters=dim, kernel_size=4, strides=2)(x)
+                x = SpectralNormalization(Conv2D(filters=dim, kernel_size=4, strides=2, padding='same'))(x)
+            else:
+                x = Conv2D(filters=dim, kernel_size=4, strides=2, padding='same')(x)
             x = LeakyReLU()(x)
 
         x = Flatten()(x)
         if self.opt.use_sp:
-            x = SpectralNormalization()(x)
-        x = Dense(dim)(x)
+            x = SpectralNormalization(Dense(dim))(x)
+        else:
+            x = Dense(dim)(x)
 
         return x
 
     def G(self, input_x, img_mask, fp_left, fp_right, use_sp=False):
-        # TODO:
+        """ U-Net for image inpainting, where we append eye embeddings in the bottleneck part. 
+        Inputs:
+            input_x: Image with eyes cropped - [B,W,H,3]
+            img_mask: Mask for eye region    - [B,W,H,3]
+            fp_left: Left eye embedding      - [B,128]
+            fp_right: Right eye embedding    - [B,128]
+        Returns:
+            Full image of face with eye gaze into camera - [B,W,H,3] 
+        """
+
+        x = tf.concat([input_x, img_mask], axis=3)
+
         if use_sp:
-            x = SpectralNormalization()(x)
-        x = Conv2d(filters=self.opt.ngf, kernel_size=7, strides=(1,1))(x)
+            x = SpectralNormalization(Conv2D(filters=self.opt.ngf, kernel_size=7, strides=(1,1), padding='same'))(x)
+        else:
+            x = Conv2D(filters=self.opt.ngf, kernel_size=7, strides=(1,1), padding='same')(x)
         x = InstanceNormalization()(x)
         x = LeakyReLU()(x)
 
+        u_fp_list = list()
         for i in range(self.opt.n_layers_g):
+
             c_dim = np.minimum(self.opt.ngf * np.power(2, i+1), 256)
             if use_sp:
-                x = SpectralNormalization()(x)
-            x = Conv2d(filters=c_dim, kernel_size=4)(x)
+                x = SpectralNormalization(Conv2D(filters=c_dim, kernel_size=4, strides=(2,2), padding='same'))(x)
+            else:
+                x = Conv2D(filters=c_dim, kernel_size=4, strides=(2,2), padding='same')(x)
             x= InstanceNormalization()(x)
             x = LeakyReLU()(x)
+
+            u_fp_list.append(x)
+        
+        h, w = x.shape.as_list()[-3], x.shape.as_list()[-2] # (?, 235, 235, 256)
+
         x = Flatten()(x)
         if use_sp:
-            x = SpectralNormalization()(x)
-        x = Dense(bottleneck)(x)
-        concat + features
+            x = SpectralNormalization(Dense(256))(x)
+        else:
+            x = Dense(256)(x)
+        x = tf.concat([x, fp_left, fp_right], axis=1) # (?, 264)
 
-        h, w = x.shape.as_list()[-3], x.shape.as_list()[-2]
         if use_sp:
-            x = SpectralNormalization()(x)
-        x = Dense(256*h*w)(x)
+            x = SpectralNormalization(Dense(256*h*w))(x)
+        else:
+            x = Dense(256*h*w)(x)
         x = LeakyReLU()(x)
         x = Reshape([h, w, 256])(x)
 
         for i in range(self.opt.n_layers_g):
-            c_dim = np.maximum(int(ngf / np.power(2, i)), 16)
-            de_x = tf.concat([de_x, u_fp_list[len(u_fp_list) - (i + 1)]], axis=3)
+            c_dim = np.maximum(int(self.opt.ngf / np.power(2, i)), 16)
+            
+            x = tf.concat([x, u_fp_list[len(u_fp_list) - (i + 1)]], axis=3)
             if use_sp:
-                x = SpectralNormalization()(x)
-                
-            x = Conv2dTransposed(output_shape=[self.opt.batch_size, h*pow(2, i+1), w*pow(2, i+1), c_dim])(x)
+                x = SpectralNormalization(Conv2DTranspose(filters=c_dim, kernel_size=4, padding='same', strides=(2,2)))(x)
+            else:
+                x = Conv2DTranspose(filters=c_dim, kernel_size=4, padding='same', strides=(2,2))(x) #, self.opt.batch_size, h*pow(2, i+1), w*pow(2, i+1), c_dim]
             x = InstanceNormalization()(x)
-            x = ReLU()(x)
+            x = LeakyReLU()(x)
         
         if use_sp:
-            x = SpectralNormalization()(x)
-        x = Conv2d(filters=c_dim, kernel_size=7, strides=(1,1))(x)
-        return tf.nn.tanh(de_x)
-        #################################################################################
+            x = SpectralNormalization(Conv2D(filters=self.opt.output_nc, kernel_size=7, strides=(1,1), padding='same'))(x)
+        else:
+            x = Conv2D(filters=self.opt.output_nc, kernel_size=7, strides=(1,1), padding='same')(x)
         
-        #conv2d_first = functools.partial(conv2d, kernel=7, stride=1, use_sp=use_sp)
-        conv2d_base = functools.partial(conv2d, kernel=4, stride=2, use_sp=use_sp)
-        fc = functools.partial(fully_connect, use_sp=use_sp)
-        
-        with tf.variable_scope("G", reuse=tf.AUTO_REUSE):
+        return tf.nn.tanh(x) # -1 <= tanh(val) <= 1, where val=R
 
-            x = tf.concat([input_x, img_mask], axis=3)
-            u_fp_list = []
-            x = lrelu(IN(conv2d_first(x, output_dim=self.opt.ngf)))
-            for i in range(self.opt.n_layers_g):
-                c_dim = np.minimum(self.opt.ngf * np.power(2, i+1), 256)
-                x = lrelu(IN(conv2d_base(x, output_dim=c_dim)
-                u_fp_list.append(x)
-
-            bottleneck = tf.reshape(x, shape=[self.opt.batch_size, -1])
-            bottleneck = fc(bottleneck, output_size=256)
-            bottleneck = tf.concat([bottleneck, fp_left, fp_right], axis=1)
-
-            h, w = x.shape.as_list()[-3], x.shape.as_list()[-2]
-            de_x = fc(bottleneck, output_size=256*h*w)
-            de_x = lrelu(de_x)
-            de_x = tf.reshape(de_x, shape=[self.opt.batch_size, h, w, 256])
-
-            ngf = c_dim
-            for i in range(self.opt.n_layers_g):
-                c_dim = np.maximum(int(ngf / np.power(2, i)), 16)
-                de_x = tf.concat([de_x, u_fp_list[len(u_fp_list) - (i + 1)]], axis=3)
-                de_conv(de_x, output_shape=[self.opt.batch_size, h*pow(2, i+1), w*pow(2, i+1), c_dim], use_sp=use_sp)
-                instance_norm()
-                de_x = tf.nn.relu()
-            de_x = conv2d_final(de_x)
-
-            return tf.nn.tanh(de_x)   
-    
     def encode(self, x):
+        """Encodes 2D image of eye region [B,H,W,3] into 1D eye embedding [B,128]
+        """
         nef = self.opt.nef
-        x = Conv2d(filters=nef, kernel_size=7, strides=(1,1), padding="same")(x)
+        x = Conv2D(filters=nef, kernel_size=7, strides=(1,1), padding="same")(x)
         x = InstanceNormalization()(x)
         x = ReLU()(x)
         for i in range(self.opt.n_layers_e):
 
-            x = Conv2d(filters=min(nef * pow(2, i+1), 128), kernel_size=4, stride=(2,2), padding="same")(x)
+            x = Conv2D(filters=min(nef * pow(2, i+1), 128), kernel_size=4, strides=(2,2), padding="same")(x)
             x = InstanceNormalization()(x)
             x = ReLU()(x)
         x = Flatten()(x)
         x = Dense(128)(x)
 
-        return content
+        return x
 
-    # Data preprocessing for mask
-    def get_Mask_and_pos(self, eye_pos, flag=0):
-        """ Given eye_pos (shape=[4,]), 
-            returns masks for cropping eyes. 
-        """
-        eye_pos = eye_pos
-        batch_mask = []
-        batch_left_eye_pos = []
-        batch_right_eye_pos = []
-        for i in range(self.opt.batch_size):
+    def decode(self, x, use_sp=False, h=16, w=16, ngf=128):
+        """Decodes 1D eye embedding [B,128] into 2D image of eye region [B,H,W,3]
+        """   
+        h, w = 2**(7-self.opt.n_layers_e), 2**(7-self.opt.n_layers_e)
 
-            current_eye_pos = eye_pos[i]
-            left_eye_pos = []
-            right_eye_pos = []
+        if use_sp:
+            x = SpectralNormalization(Dense(256*h*w))(x)
+        else:
+            x = Dense(256*h*w)(x)
+        x = LeakyReLU()(x)
+        x = Reshape([h, w, 256])(x)
 
-            if flag == 0:
+        for i in range(self.opt.n_layers_e):
+            num_filters = np.maximum(int(ngf / np.power(2, i)), 16)
+            if use_sp:
+                x = SpectralNormalization(Conv2DTranspose(filters=num_filters, kernel_size=4, padding='same', strides=(2,2)))(x)
+            else:
+                x = Conv2DTranspose(filters=num_filters, kernel_size=4, padding='same', strides=(2,2))(x)
+            x = InstanceNormalization()(x)
+            x = LeakyReLU()(x)
 
-                mask = np.zeros(shape=[self.opt.img_size, self.opt.img_size, self.opt.output_nc])
-                scale = current_eye_pos[1] - 15
-                down_scale = current_eye_pos[1] + 15
-                l1_1 =int(scale)
-                u1_1 =int(down_scale)
-                #x
-                scale = current_eye_pos[0] - 25
-                down_scale = current_eye_pos[0] + 25
-                l1_2 = int(scale)
-                u1_2 = int(down_scale)
-
-                mask[l1_1:u1_1, l1_2:u1_2, :] = 1.0
-                left_eye_pos.append(float(l1_1)/self.opt.img_size)
-                left_eye_pos.append(float(l1_2)/self.opt.img_size)
-                left_eye_pos.append(float(u1_1)/self.opt.img_size)
-                left_eye_pos.append(float(u1_2)/self.opt.img_size)
-
-                scale = current_eye_pos[3] - 15
-                down_scale = current_eye_pos[3] + 15
-                l2_1 = int(scale)
-                u2_1 = int(down_scale)
-
-                scale = current_eye_pos[2] - 25
-                down_scale = current_eye_pos[2] + 25
-                l2_2 = int(scale)
-                u2_2 = int(down_scale)
-
-                mask[l2_1:u2_1, l2_2:u2_2, :] = 1.0
-
-                right_eye_pos.append(float(l2_1) / self.opt.img_size)
-                right_eye_pos.append(float(l2_2) / self.opt.img_size)
-                right_eye_pos.append(float(u2_1) / self.opt.img_size)
-                right_eye_pos.append(float(u2_2) / self.opt.img_size)
-
-            batch_mask.append(mask)
-            batch_left_eye_pos.append(left_eye_pos)
-            batch_right_eye_pos.append(right_eye_pos)
-
-        return np.array(batch_mask), np.array(batch_left_eye_pos), np.array(batch_right_eye_pos)
-
+        if use_sp:
+            x = SpectralNormalization(Conv2D(filters=self.opt.output_nc, kernel_size=7, strides=(1,1), padding='same'))(x)
+        else:
+            x = Conv2D(filters=self.opt.output_nc, kernel_size=7, strides=(1,1), padding='same')(x)
+        
+        return tf.nn.tanh(x) # -1 <= tanh(val) <= 1, where val=R
 
 
 
@@ -560,15 +485,6 @@ class Gaze_GAN(object):
         self.xl_right_fp = self.encode(self.xl_right)
         self.yo = self.G(self.xc, self.xm, self.xl_left_fp, self.xl_right_fp, use_sp=False)
         self.y = self.xc + self.yo * self.xm
-
-
-    def crop_resize(self, input, boxes_left, boxes_right):
-
-        shape = [int(item) for item in input.shape.as_list()]
-        return tf.image.crop_and_resize(input, boxes=boxes_left, box_ind=list(range(0, shape[0])),
-                                        crop_size=[int(shape[-3] / 2), int(shape[-2] / 2)]), \
-                tf.image.crop_and_resize(input, boxes=boxes_right, box_ind=list(range(0, shape[0])),
-                                    crop_size=[int(shape[-3] / 2), int(shape[-2] / 2)])
 
     def test(self):
 
